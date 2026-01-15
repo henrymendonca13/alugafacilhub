@@ -1,0 +1,117 @@
+import os
+from datetime import datetime, timedelta
+from typing import List, Optional
+from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+import stripe
+
+from . import models, schemas, auth, database
+
+# Configurações iniciais
+app = FastAPI(title="AlugaFácil Hub API", version="1.0.0")
+
+# Habilitar CORS para WordPress e integração externa
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Em produção, substitua pelo domínio do seu WordPress
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+# Criar tabelas ao iniciar (Ideal para o Render Free)
+@app.on_event("startup")
+async def startup():
+    async with database.engine.begin() as conn:
+        await conn.run_sync(models.Base.metadata.create_all)
+
+# --- ENDPOINTS DE AUTENTICAÇÃO ---
+
+@app.post("/auth/register", response_model=schemas.PartnerOut)
+async def register(partner: schemas.PartnerCreate, db: AsyncSession = Depends(database.get_db)):
+    # Verificar se email existe
+    result = await db.execute(select(models.Partner).where(models.Partner.email == partner.email))
+    if result.scalars().first():
+        raise HTTPException(status_code=400, detail="Email já cadastrado")
+    
+    hashed_pw = auth.get_password_hash(partner.password)
+    new_partner = models.Partner(
+        **partner.dict(exclude={"password"}),
+        hashed_password=hashed_pw,
+        slug=partner.company_name.lower().replace(" ", "-")
+    )
+    db.add(new_partner)
+    await db.commit()
+    await db.refresh(new_partner)
+    return new_partner
+
+@app.post("/auth/token")
+async def login(form_data: auth.OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(database.get_db)):
+    partner = await auth.authenticate_partner(db, form_data.username, form_data.password)
+    if not partner:
+        raise HTTPException(status_code=401, detail="Credenciais incorretas")
+    
+    access_token = auth.create_access_token(data={"sub": partner.email})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# --- ENDPOINTS DE FATURAMENTO (STRIPE) ---
+
+@app.post("/billing/create-checkout")
+async def create_checkout(current_partner: models.Partner = Depends(auth.get_current_partner)):
+    try:
+        checkout_session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{'price': 'ID_DO_PRECO_STRIPE', 'quantity': 1}],
+            mode='subscription',
+            success_url="https://seu-site.com/dashboard?success=true",
+            cancel_url="https://seu-site.com/billing",
+            client_reference_id=str(current_partner.id)
+        )
+        return {"url": checkout_session.url}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/webhook")
+async def stripe_webhook(request: Request, db: AsyncSession = Depends(database.get_db)):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+
+    if event['type'] == 'checkout.session.completed':
+        session = event['data']['object']
+        partner_id = session.get('client_reference_id')
+        # Lógica para ativar o parceiro no banco de dados
+        result = await db.execute(select(models.Partner).where(models.Partner.id == int(partner_id)))
+        partner = result.scalars().first()
+        if partner:
+            partner.status = models.PartnerStatus.ACTIVE
+            await db.commit()
+
+    return {"status": "success"}
+
+# --- API PÚBLICA (PARA WORDPRESS) ---
+
+@app.get("/public/imoveis")
+async def list_properties(city: Optional[str] = None, db: AsyncSession = Depends(database.get_db)):
+    query = select(models.Property).where(models.Property.is_active == True)
+    if city:
+        query = query.where(models.Property.city == city)
+    
+    result = await db.execute(query)
+    return result.scalars().all()
+
+@app.get("/public/parceiro/{slug}")
+async def get_partner_site(slug: str, db: AsyncSession = Depends(database.get_db)):
+    result = await db.execute(select(models.Partner).where(models.Partner.slug == slug))
+    partner = result.scalars().first()
+    if not partner:
+        raise HTTPException(status_code=404, detail="Parceiro não encontrado")
+    return partner
