@@ -115,3 +115,8 @@ async def get_partner_site(slug: str, db: AsyncSession = Depends(database.get_db
     if not partner:
         raise HTTPException(status_code=404, detail="Parceiro não encontrado")
     return partner
+from .routers import partners, properties, billing
+
+app.include_router(partners.router)
+app.include_router(properties.router)
+app.include_router(billing.router)
